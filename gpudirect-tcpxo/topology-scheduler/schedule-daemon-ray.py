@@ -24,6 +24,8 @@ from kubernetes.utils.quantity import parse_quantity
 from absl import logging
 
 logging.set_verbosity(logging.INFO)
+# logging.get_absl_handler().setFormatter()
+# logging.Formatter(fmt='%(name)s:%(levelname):%(filename)s:%(lineno)s %(message)s')
 
 def split_pods_based_on_jobs(pods):
   """Splits pending pods into groups based on jobs."""
@@ -32,12 +34,8 @@ def split_pods_based_on_jobs(pods):
       for _, job_group in groupby(pods, lambda pod: pod.get('job_name'))
   ]
 
-def split_pods_based_on_ray_cluster(pods):
-  """Splits pending pods into groups based on jobs."""
-  return [
-      list(ray_cluster_group)
-      for _, ray_cluster_group in groupby(pods, lambda pod: pod.get('ray_cluster'))
-  ]
+def ray_to_job_name(ray_cluster, ray_worker_group):
+  return f"{ray_cluster}/{ray_worker_group}"
 
 def sort_jobs_by_time(job):
   """Return the key to be used for sorting jobs which is by creation time."""
@@ -211,6 +209,36 @@ def find_pod_gates(pods, prefix):
           s.add(g.name)
   return s
 
+def find_running_ray_clusters(pods):
+  ray_clusters = {}
+
+  for pod in pods:
+    if (pod.metadata.labels is not None and
+        'ray.io/node-type' in pod.metadata.labels and
+        pod.metadata.labels['ray.io/node-type'] == 'worker' and
+        pod.status.phase == 'Running'):
+      if 'ray.io/cluster' in pod.metadata.labels:
+        ray_cluster = pod.metadata.labels['ray.io/cluster']
+      else:
+        logging.info('Unable to find Ray Cluster in metadata. Can not queue pod')
+
+      if 'ray.io/group' in pod.metadata.labels:
+        ray_worker_group = pod.metadata.labels['ray.io/group']
+      else:
+        logging.info('Unable to find Ray worker group in metadata. Can not queue pod')
+
+      job_name = ray_to_job_name(ray_cluster, ray_worker_group)
+      if ray_cluster not in ray_clusters:
+        ray_clusters[job_name] = []
+
+      ray_clusters[job_name].append(pod)
+      logging.info(f"Found cluster {ray_cluster}, worker_group {ray_worker_group} for running pod {pod.metadata.name}")
+    # else:
+    #   logging.info(f"{pod.metadata.name} not a ray worker")
+
+  logging.info(f"Running ray clusters: {list(set(ray_clusters.keys()))}")
+  return ray_clusters
+
 def find_schedulable_pods_ray_cluster(pods, gate_name):
   """Finds pods that can be scheduled."""
   pods_to_schedule = {}
@@ -267,7 +295,7 @@ def find_schedulable_pods_ray_cluster(pods, gate_name):
               'name': pod_name,
               'namespace': pod_namespace,
               'ray_cluster': ray_cluster,
-              'job_name': ray_cluster,
+              'job_name': ray_to_job_name(ray_cluster, ray_worker_group),
               'ray_worker_group': ray_worker_group,
               'cpu': used_cpu,
               'memory': used_memory,
@@ -287,11 +315,10 @@ def find_schedulable_pods_ray_cluster(pods, gate_name):
   # TODO: group by ray_cluster, ray_worker_group then assign consecutive indices
   # to all workers within a group
 
-  ray_clusters = split_pods_based_on_ray_cluster(pods_to_schedule.values())
+  ray_clusters = split_pods_based_on_jobs(pods_to_schedule.values())
   for cluster in ray_clusters:
-    sorted_pods = sorted(cluster, key=lambda pod: pod["ray_worker_group"])
     idx = 0
-    for pod in sorted_pods:
+    for pod in cluster:
       pod["index"] = idx
       idx += 1
 
@@ -419,12 +446,13 @@ def schedule_pod_on_node(v1, pod_name, pod_namespace, node_name, gate_name):
     logging.info(f'Exception when removing scheduling gate: {e}')
 
 
-def calculate_pods_assignment(sorted_nodes, sorted_pods):
+def calculate_pods_assignment(sorted_nodes, sorted_pods, running_pods):
   """Calculates the best assignment for pods."""
   assignment = [-i for i in reversed(range(1, len(sorted_pods) + 1))]
   best_assignment = []
   minimum_distance = 1000000000
 
+  # TODO TODO TODO: Update to account for running_pods!
   while True:
     all_ok = True
     i = len(assignment) - 1
@@ -457,13 +485,14 @@ def schedule_pod_with_gate(v1, pods, gate):
   # TODO: Requires indexed Jobs right now, need to make work with RayCluster
   pods_to_schedule = find_schedulable_pods(pods, gate)
   ray_pods_to_schedule = find_schedulable_pods_ray_cluster(pods, gate)
+  running_ray_clusters = find_running_ray_clusters(pods)
 
   all_pods_to_schedule = pods_to_schedule.update(ray_pods_to_schedule)
 
   nodes = v1.list_node().items
   logging.info(f'Pods to schedule: {len(pods_to_schedule)}')
   for p in pods_to_schedule:
-    logging.info(f"{pods_to_schedule[p]}")
+    logging.info(f"{pods_to_schedule[p]['name']}")
   jobs = split_pods_based_on_jobs(pods_to_schedule.values())
   sorted_jobs = sorted(jobs, key=sort_jobs_by_time)
   for job in sorted_jobs:
@@ -483,7 +512,13 @@ def schedule_pod_with_gate(v1, pods, gate):
 
     # TODO: Needs to be modified to enable new pods to be added in a
     # topology-aware way to already-running pods
-    best_assignment = calculate_pods_assignment(sorted_nodes, sorted_pods)
+    running_pods = []
+    sample_pod = job[0]
+    if "ray_cluster" in sample_pod:
+      if sample_pod["job_name"] in running_ray_clusters:
+        running_pods = running_ray_clusters[sample_pod["job_name"]]
+        logging.info(f"Found running pods for job {sample_pod['job_name']}")
+    best_assignment = calculate_pods_assignment(sorted_nodes, sorted_pods, running_pods)
 
     if not best_assignment:
       logging.info(
@@ -494,12 +529,12 @@ def schedule_pod_with_gate(v1, pods, gate):
     else:
       logging.info(f'Assignment found, scheduling {job_name} with {len(sorted_pods)} pods.')
 
-    for i in range(0, len(sorted_pods)):
-      pod = sorted_pods[i]
-      node = sorted_nodes[best_assignment[i]]
-      schedule_pod_on_node(
-          v1, pod['name'], pod['namespace'], node['name'], gate
-      )
+    # for i in range(0, len(sorted_pods)):
+    #   pod = sorted_pods[i]
+    #   node = sorted_nodes[best_assignment[i]]
+    #   schedule_pod_on_node(
+    #       v1, pod['name'], pod['namespace'], node['name'], gate
+    #   )
 
 def schedule_iteration(v1, ignored_namespace, gate):
   def list_pods():
